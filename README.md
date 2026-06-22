@@ -1,0 +1,31 @@
+- Provide a tool for analysing disk usage on Linux written in C with the following specification:
+  - Works for regular, non-privileged users
+  - Input:
+    - Path to a directory or file
+  - Output:
+    - The canonical path to the target file or directory
+    - The total apparent size (`st_size`) and blocks (`st_blocks`) of the target file or directory
+    - The number of regular files, directories, symlinks separately, and other file types in the target directory 
+    - The number of permission denied errors encountered while traversing the directory tree
+    - Default output in human readable format
+  - Cache:
+    - Cache the results to a file in `$TMPDIR` defaulting to `/tmp` for canonical path
+    - Timestamp the cache
+    - If cache exists and reads results from the cache. Report how old the cache was when read.
+  - Use the lazy size on MDT feature via `statx()` system call with `AT_STATX_DONT_SYNC` flag to efficiently query approximate file size and blocks from Lustre MDT.
+  - Directory traversal:
+    - Implement efficient directory traversal
+    - Does NOT follow symlinks
+    - Skip `.` and `..` directories
+  - Flags:
+    - `--csv` 
+      - Reports output in parsable CSV format.
+    - `--sync-size` 
+      - Do NOT set `AT_STATX_DONT_SYNC` flag.
+    - `--no-cache` 
+      - Do NOT read cache. Still write the cache.
+    - `--progress` 
+      - Show a progress bar of how many files are processed. Update every 100 files.
+- References
+  - [https://man7.org/linux/man-pages/man2/statx.2.html](https://man7.org/linux/man-pages/man2/statx.2.html)
+  - [https://wiki.lustre.org/images/4/4f/LUG2018-Lazy_Size_on_MDS-Xi.pdf](https://wiki.lustre.org/images/4/4f/LUG2018-Lazy_Size_on_MDS-Xi.pdf)
