@@ -4,7 +4,7 @@
 # https://www.gnu.org/prep/standards/html_node/Makefile-Conventions.html
 
 # Package metadata
-PACKAGE     = du_lazy
+PACKAGE     = filesystem_usage_explorer
 VERSION     = 1.0.0
 
 # Programs and utilities
