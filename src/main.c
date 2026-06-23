@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <time.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -51,7 +52,9 @@ struct cache_data {
     uint64_t perm_denied_count;
 };
 
-/* 64-bit FNV-1a hash algorithm for secure, collision-resistant cache keying */
+/* 64-bit FNV-1a hash used only to derive a cache filename from the canonical
+ * path.  This is a fast non-cryptographic hash; collisions are harmless because
+ * the cache reader re-compares the full canonical path before trusting a hit. */
 uint64_t fnv1a_64(const char *str) {
     uint64_t hash = 0xcbf29ce484222325ULL;
     while (*str) {
@@ -71,7 +74,7 @@ void format_size(uint64_t bytes, char *buf, size_t buf_size) {
         unit_idx++;
     }
     if (unit_idx == 0) {
-        snprintf(buf, buf_size, "%lu B", (unsigned long)bytes);
+        snprintf(buf, buf_size, "%" PRIu64 " B", bytes);
     } else {
         snprintf(buf, buf_size, "%.2f %s", size, units[unit_idx]);
     }
@@ -80,7 +83,7 @@ void format_size(uint64_t bytes, char *buf, size_t buf_size) {
 /* Helper to format numbers with commas (e.g. 1000 -> 1,000) */
 void format_commas(uint64_t val, char *buf, size_t buf_size) {
     char temp[32];
-    int len = snprintf(temp, sizeof(temp), "%lu", (unsigned long)val);
+    int len = snprintf(temp, sizeof(temp), "%" PRIu64, val);
     if (len <= 0) {
         buf[0] = '\0';
         return;
@@ -120,15 +123,15 @@ void print_results(const char *canonical_path, uint64_t total_size, uint64_t tot
                    uint64_t perm_denied, bool csv_mode) {
     if (csv_mode) {
         printf("canonical_path,total_size_bytes,total_blocks,reg_files,directories,symlinks,other,perm_denied_errors\n");
-        printf("\"%s\",%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        printf("\"%s\",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
                canonical_path,
-               (unsigned long)total_size,
-               (unsigned long)total_blocks,
-               (unsigned long)reg_count,
-               (unsigned long)dir_count,
-               (unsigned long)sym_count,
-               (unsigned long)other_count,
-               (unsigned long)perm_denied);
+               total_size,
+               total_blocks,
+               reg_count,
+               dir_count,
+               sym_count,
+               other_count,
+               perm_denied);
     } else {
         char size_buf[64];
         char blocks_buf[64];
@@ -139,116 +142,142 @@ void print_results(const char *canonical_path, uint64_t total_size, uint64_t tot
         printf("Disk Usage Analysis Report\n");
         printf("--------------------------------------------------\n");
         printf("Canonical Path:           %s\n", canonical_path);
-        printf("Total Apparent Size:      %s (%lu bytes)\n", size_buf, (unsigned long)total_size);
-        printf("Total Allocated Blocks:   %lu (allocated size: %s)\n", (unsigned long)total_blocks, blocks_buf);
-        printf("Regular Files Count:      %lu\n", (unsigned long)reg_count);
-        printf("Directories Count:        %lu\n", (unsigned long)dir_count);
-        printf("Symbolic Links Count:     %lu\n", (unsigned long)sym_count);
-        printf("Other Files Count:        %lu\n", (unsigned long)other_count);
-        printf("Permission Denied Errors: %lu\n", (unsigned long)perm_denied);
+        printf("Total Apparent Size:      %s (%" PRIu64 " bytes)\n", size_buf, total_size);
+        printf("Total Allocated Blocks:   %" PRIu64 " (allocated size: %s)\n", total_blocks, blocks_buf);
+        printf("Regular Files Count:      %" PRIu64 "\n", reg_count);
+        printf("Directories Count:        %" PRIu64 "\n", dir_count);
+        printf("Symbolic Links Count:     %" PRIu64 "\n", sym_count);
+        printf("Other Files Count:        %" PRIu64 "\n", other_count);
+        printf("Permission Denied Errors: %" PRIu64 "\n", perm_denied);
         printf("--------------------------------------------------\n");
     }
 }
 
-/* Recursive traversal logic */
-void traverse(const char *path, struct stats *s, int flags_statx, bool show_progress) {
-    DIR *dir = opendir(path);
-    if (!dir) {
-        if (errno == EACCES) {
-            s->perm_denied_count++;
-        } else {
-            fprintf(stderr, "Error opening directory %s: %s\n", path, strerror(errno));
+/* A growable LIFO stack of heap-owned directory paths still to be visited.
+ * Using an explicit stack keeps traversal depth off the C call stack, so deep
+ * directory trees can no longer cause a stack overflow. */
+struct dir_stack {
+    char **items;
+    size_t count;
+    size_t cap;
+};
+
+/* Push a copy of path onto the stack.  Returns false on allocation failure. */
+static bool dir_stack_push(struct dir_stack *st, const char *path) {
+    if (st->count >= st->cap) {
+        size_t new_cap = st->cap == 0 ? 64 : st->cap * 2;
+        char **new_items = realloc(st->items, new_cap * sizeof(char *));
+        if (!new_items) {
+            return false;
         }
+        st->items = new_items;
+        st->cap = new_cap;
+    }
+    char *copy = strdup(path);
+    if (!copy) {
+        return false;
+    }
+    st->items[st->count++] = copy;
+    return true;
+}
+
+/* Pop the top path (transferring ownership to the caller), or NULL if empty. */
+static char *dir_stack_pop(struct dir_stack *st) {
+    if (st->count == 0) {
+        return NULL;
+    }
+    return st->items[--st->count];
+}
+
+/* Iterative traversal logic.  Visits the tree rooted at root_path depth-first
+ * using an explicit stack rather than recursion. */
+void traverse(const char *root_path, struct stats *s, int flags_statx, bool show_progress) {
+    struct dir_stack stack = {0};
+    if (!dir_stack_push(&stack, root_path)) {
+        fprintf(stderr, "Memory allocation error\n");
         return;
     }
 
-    int dfd = dirfd(dir);
-    if (dfd < 0) {
-        fprintf(stderr, "Error acquiring file descriptor for %s: %s\n", path, strerror(errno));
-        closedir(dir);
-        return;
-    }
-
-    char **subdirs = NULL;
-    size_t subdir_count = 0;
-    size_t subdir_cap = 0;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        struct statx stx;
-        if (statx(dfd, entry->d_name, AT_SYMLINK_NOFOLLOW | flags_statx, 
-                  STATX_TYPE | STATX_SIZE | STATX_BLOCKS, &stx) != 0) {
+    char *path;
+    while ((path = dir_stack_pop(&stack)) != NULL) {
+        DIR *dir = opendir(path);
+        if (!dir) {
             if (errno == EACCES) {
                 s->perm_denied_count++;
             } else {
-                fprintf(stderr, "Error querying %s/%s: %s\n", path, entry->d_name, strerror(errno));
+                fprintf(stderr, "Error opening directory %s: %s\n", path, strerror(errno));
             }
+            free(path);
             continue;
         }
 
-        s->total_size += stx.stx_size;
-        s->total_blocks += stx.stx_blocks;
-        s->total_processed++;
-
-        if (show_progress && (s->total_processed % 100 == 0)) {
-            char processed_str[32];
-            format_commas(s->total_processed, processed_str, sizeof(processed_str));
-            fprintf(stderr, "\rProcessed: %s files/directories...", processed_str);
-            fflush(stderr);
+        int dfd = dirfd(dir);
+        if (dfd < 0) {
+            fprintf(stderr, "Error acquiring file descriptor for %s: %s\n", path, strerror(errno));
+            closedir(dir);
+            free(path);
+            continue;
         }
 
-        if (S_ISLNK(stx.stx_mode)) {
-            s->sym_count++;
-        } else if (S_ISREG(stx.stx_mode)) {
-            s->reg_count++;
-        } else if (S_ISDIR(stx.stx_mode)) {
-            s->dir_count++;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
 
-            /* Save the directory entry name to recurse after closing this handle */
-            if (subdir_count >= subdir_cap) {
-                subdir_cap = subdir_cap == 0 ? 16 : subdir_cap * 2;
-                char **new_subdirs = realloc(subdirs, subdir_cap * sizeof(char *));
-                if (!new_subdirs) {
-                    fprintf(stderr, "Memory allocation error\n");
-                    for (size_t i = 0; i < subdir_count; i++) free(subdirs[i]);
-                    free(subdirs);
-                    closedir(dir);
-                    return;
+            struct statx stx;
+            if (statx(dfd, entry->d_name, AT_SYMLINK_NOFOLLOW | flags_statx,
+                      STATX_TYPE | STATX_SIZE | STATX_BLOCKS, &stx) != 0) {
+                if (errno == EACCES) {
+                    s->perm_denied_count++;
+                } else {
+                    fprintf(stderr, "Error querying %s/%s: %s\n", path, entry->d_name, strerror(errno));
                 }
-                subdirs = new_subdirs;
+                continue;
             }
-            subdirs[subdir_count] = strdup(entry->d_name);
-            if (!subdirs[subdir_count]) {
-                fprintf(stderr, "Memory allocation error\n");
-                for (size_t i = 0; i < subdir_count; i++) free(subdirs[i]);
-                free(subdirs);
-                closedir(dir);
-                return;
-            }
-            subdir_count++;
-        } else {
-            s->other_count++;
-        }
-    }
-    closedir(dir); /* Closed immediately to minimize concurrent FD usage */
 
-    /* Recurse into subdirectories recursively */
-    for (size_t i = 0; i < subdir_count; i++) {
-        char subpath[PATH_MAX];
-        int len = snprintf(subpath, sizeof(subpath), "%s/%s", path, subdirs[i]);
-        if (len >= (int)sizeof(subpath)) {
-            fprintf(stderr, "Warning: Path too long, skipping subdirectory: %s\n", subdirs[i]);
-            free(subdirs[i]);
-            continue;
+            s->total_size += stx.stx_size;
+            s->total_blocks += stx.stx_blocks;
+            s->total_processed++;
+
+            if (show_progress && (s->total_processed % 100 == 0)) {
+                char processed_str[32];
+                format_commas(s->total_processed, processed_str, sizeof(processed_str));
+                fprintf(stderr, "\rProcessed: %s files/directories...", processed_str);
+                fflush(stderr);
+            }
+
+            if (S_ISLNK(stx.stx_mode)) {
+                s->sym_count++;
+            } else if (S_ISREG(stx.stx_mode)) {
+                s->reg_count++;
+            } else if (S_ISDIR(stx.stx_mode)) {
+                s->dir_count++;
+
+                /* Build the child path and queue it for a later iteration. */
+                char subpath[PATH_MAX];
+                int len = snprintf(subpath, sizeof(subpath), "%s/%s", path, entry->d_name);
+                if (len >= (int)sizeof(subpath)) {
+                    fprintf(stderr, "Warning: Path too long, skipping subdirectory: %s/%s\n",
+                            path, entry->d_name);
+                    continue;
+                }
+                if (!dir_stack_push(&stack, subpath)) {
+                    fprintf(stderr, "Memory allocation error\n");
+                }
+            } else {
+                s->other_count++;
+            }
         }
-        free(subdirs[i]);
-        traverse(subpath, s, flags_statx, show_progress);
+        closedir(dir); /* Closed immediately to minimize concurrent FD usage */
+        free(path);
     }
-    free(subdirs);
+
+    /* Free any paths still queued (only reachable on allocation failure). */
+    for (size_t i = 0; i < stack.count; i++) {
+        free(stack.items[i]);
+    }
+    free(stack.items);
 }
 
 int main(int argc, char *argv[]) {
@@ -387,27 +416,25 @@ int main(int argc, char *argv[]) {
                   s.dir_count, s.sym_count, s.other_count, s.perm_denied_count, csv_mode);
 
     /* Write Cache results */
-    if (true) {
-        struct cache_data cache;
-        strncpy(cache.canonical_path, canonical_path, PATH_MAX - 1);
-        cache.canonical_path[PATH_MAX - 1] = '\0';
-        cache.timestamp = time(NULL);
-        cache.total_size = s.total_size;
-        cache.total_blocks = s.total_blocks;
-        cache.reg_count = s.reg_count;
-        cache.dir_count = s.dir_count;
-        cache.sym_count = s.sym_count;
-        cache.other_count = s.other_count;
-        cache.perm_denied_count = s.perm_denied_count;
+    struct cache_data cache;
+    strncpy(cache.canonical_path, canonical_path, PATH_MAX - 1);
+    cache.canonical_path[PATH_MAX - 1] = '\0';
+    cache.timestamp = time(NULL);
+    cache.total_size = s.total_size;
+    cache.total_blocks = s.total_blocks;
+    cache.reg_count = s.reg_count;
+    cache.dir_count = s.dir_count;
+    cache.sym_count = s.sym_count;
+    cache.other_count = s.other_count;
+    cache.perm_denied_count = s.perm_denied_count;
 
-        /* Save cache files with strict user-only read/write privileges (0600) */
-        int fd = open(cache_filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-        if (fd >= 0) {
-            if (write(fd, &cache, sizeof(struct cache_data)) != sizeof(struct cache_data)) {
-                fprintf(stderr, "Warning: Failed to successfully write cache to file.\n");
-            }
-            close(fd);
+    /* Save cache files with strict user-only read/write privileges (0600) */
+    int cache_fd = open(cache_filepath, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (cache_fd >= 0) {
+        if (write(cache_fd, &cache, sizeof(struct cache_data)) != sizeof(struct cache_data)) {
+            fprintf(stderr, "Warning: Failed to successfully write cache to file.\n");
         }
+        close(cache_fd);
     }
 
     return 0;
