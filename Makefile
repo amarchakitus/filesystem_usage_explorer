@@ -4,8 +4,8 @@
 # https://www.gnu.org/prep/standards/html_node/Makefile-Conventions.html
 
 # Package metadata
-PACKAGE     = filesystem_usage_explorer
-VERSION     = 1.0.0
+PACKAGE = fue
+VERSION = $(shell git describe --tags 2>/dev/null)
 
 # Programs and utilities
 INSTALL         = install

@@ -315,7 +315,7 @@ int main(int argc, char *argv[]) {
 
     uint64_t path_hash = fnv1a_64(canonical_path);
     char cache_filepath[PATH_MAX];
-    snprintf(cache_filepath, sizeof(cache_filepath), "%s/du_cache_%016llx.bin", tmpdir, (unsigned long long)path_hash);
+    snprintf(cache_filepath, sizeof(cache_filepath), "%s/fue_cache_%016llx.bin", tmpdir, (unsigned long long)path_hash);
 
     if (!no_cache) {
         /* Open securely using O_NOFOLLOW to mitigate symlink vulnerabilities */
