@@ -36,7 +36,6 @@ glibc 2.28+).
 ```sh
 make            # build ./fue
 make check      # build and run a smoke test against the current directory
-make clean      # remove build artifacts
 ```
 
 Build flags can be overridden on the command line, for example:
@@ -50,10 +49,8 @@ make CC=clang CFLAGS='-O3 -march=native'
 Installs to `/usr/local` by default, honoring `prefix` and `DESTDIR`:
 
 ```sh
-sudo make install                 # -> /usr/local/bin/fue
-make install prefix=$HOME/.local  # user-local install
-make install-strip                # install with symbols stripped
-sudo make uninstall
+make install prefix=$HOME/.local        # user-local install
+make install-strip prefix=$HOME/.local  # install with symbols stripped
 ```
 
 ## Usage
