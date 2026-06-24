@@ -44,8 +44,17 @@ struct stats {
     uint64_t total_processed;
 };
 
-/* Cache file structure */
+/* Cache file format identity. Bump CACHE_VERSION whenever the on-disk layout or
+ * the semantics of any cached field change, so older incompatible cache files
+ * are rejected instead of silently misread under the new layout. */
+#define CACHE_MAGIC   0x46554543u   /* "FUEC" */
+#define CACHE_VERSION 1u
+
+/* Cache file structure. magic and version are kept first so they sit at a
+ * stable offset and stay interpretable even if the rest of the layout changes. */
 struct cache_data {
+    uint32_t magic;
+    uint32_t version;
     char canonical_path[PATH_MAX];
     time_t timestamp;
     uint64_t total_size;
@@ -361,7 +370,8 @@ int main(int argc, char *argv[]) {
         if (fd >= 0) {
             struct cache_data cached_val;
             if (read(fd, &cached_val, sizeof(struct cache_data)) == sizeof(struct cache_data)) {
-                if (strcmp(cached_val.canonical_path, canonical_path) == 0) {
+                if (cached_val.magic == CACHE_MAGIC && cached_val.version == CACHE_VERSION &&
+                    strcmp(cached_val.canonical_path, canonical_path) == 0) {
                     time_t now = time(NULL);
                     double age_seconds = difftime(now, cached_val.timestamp);
                     char age_str[128];
@@ -426,6 +436,8 @@ int main(int argc, char *argv[]) {
 
     /* Write Cache results */
     struct cache_data cache;
+    cache.magic = CACHE_MAGIC;
+    cache.version = CACHE_VERSION;
     strncpy(cache.canonical_path, canonical_path, PATH_MAX - 1);
     cache.canonical_path[PATH_MAX - 1] = '\0';
     cache.timestamp = time(NULL);
