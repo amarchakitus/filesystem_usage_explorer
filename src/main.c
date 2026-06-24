@@ -18,6 +18,11 @@
 #define PATH_MAX 4096
 #endif
 
+/* Version string is normally injected by the build (see Makefile). */
+#ifndef FUE_VERSION
+#define FUE_VERSION "unknown"
+#endif
+
 /* Fallback definitions for older header versions if necessary */
 #ifndef AT_STATX_DONT_SYNC
 #define AT_STATX_DONT_SYNC 0x4000
@@ -296,6 +301,9 @@ int main(int argc, char *argv[]) {
             no_cache = true;
         } else if (strcmp(argv[i], "--progress") == 0) {
             show_progress = true;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            printf("fue %s\n", FUE_VERSION);
+            return 0;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Disk Usage Analyzer (optimized via statx)\n");
             printf("Usage: %s [options] <path>\n\n", argv[0]);
@@ -304,6 +312,7 @@ int main(int argc, char *argv[]) {
             printf("  --sync-size    Toggle AT_STATX_DONT_SYNC off for accurate synchronization\n");
             printf("  --no-cache     Do not read cache files\n");
             printf("  --progress     Display a live file counter\n");
+            printf("  --version      Show version information\n");
             printf("  -h, --help     Show this message\n");
             return 0;
         } else if (argv[i][0] == '-') {

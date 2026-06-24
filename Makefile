@@ -46,10 +46,13 @@ all: $(PROGRAM)
 $(PROGRAM): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
+# Version string baked into the binary at compile time.
+VERSION_DEF = -DFUE_VERSION='"$(VERSION)"'
+
 # Compile objects.  Pattern rule mirrors the built-in GNU rule but is
 # spelled out for clarity.
 $(srcdir)/%.o: $(srcdir)/%.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) -c -o $@ $<
 
 # Install / uninstall.
 .PHONY: install
