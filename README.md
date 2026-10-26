@@ -17,6 +17,10 @@ results so repeated queries on the same path return instantly.
   synchronization with OSTs. Use `--sync-size` when you need exact values.
 - **Non-privileged** — runs as any user; permission-denied errors are counted
   and reported rather than aborting the traversal.
+- **Parallel traversal** — a pool of worker threads (8 by default, `-j` to
+  change) shares a queue of pending directories, keeping several metadata
+  requests in flight at once. On network filesystems, where each `statx()` is a
+  server round-trip, this is several times faster than a serial walk.
 - **Iterative traversal** — directories are walked with an explicit heap stack,
   so arbitrarily deep trees won't overflow the call stack. Symlinks are not
   followed; `.` and `..` are skipped.
@@ -25,6 +29,8 @@ results so repeated queries on the same path return instantly.
   result is.
 - **Human-readable or CSV output** — readable report by default, or
   machine-parsable CSV with `--csv`.
+- **Per-directory breakdown** — `--depth N` reports usage for every directory
+  up to `N` levels below the target, from a single traversal.
 - **Live progress** — optional progress counter updated every 100 entries.
 
 ## Building
@@ -59,13 +65,15 @@ make install-strip prefix=$HOME/.local  # install with symbols stripped
 fue [options] <path>
 ```
 
-| Option         | Description                                                             |
-| -------------- | ----------------------------------------------------------------------- |
-| `--csv`        | Output in parsable CSV format.                                          |
-| `--sync-size`  | Turn off `AT_STATX_DONT_SYNC` to get exact (synchronized) sizes.        |
-| `--no-cache`   | Do not read an existing cache. The cache is still written afterwards.   |
-| `--progress`   | Show a live counter of processed entries (updated every 100), on stderr.|
-| `-h`, `--help` | Show usage and exit.                                                    |
+| Option               | Description                                                              |
+| -------------------- | ------------------------------------------------------------------------ |
+| `--csv`              | Output in parsable CSV format.                                           |
+| `--sync-size`        | Turn off `AT_STATX_DONT_SYNC` to get exact (synchronized) sizes.         |
+| `--no-cache`         | Do not read an existing cache. The cache is still written afterwards.    |
+| `--progress`         | Show a live counter of processed entries (updated every 100), on stderr. |
+| `-j`, `--threads N`  | Scan with `N` parallel threads, 1–256 (default 8). `-j 1` is serial.     |
+| `-d`, `--depth N`    | Break usage down by directory, `N` levels deep (see below).              |
+| `-h`, `--help`       | Show usage and exit.                                                     |
 
 Exactly one target path is required.
 
@@ -77,6 +85,12 @@ fue /scratch/project_2001234
 
 # Force fresh results, ignoring any cache, with progress
 fue --no-cache --progress /scratch/project_2001234
+
+# Usage of each project directory and one level below it
+fue --depth 2 /scratch/project_2001234
+
+# Use more threads on a large tree (or -j 1 for a gentle serial scan)
+fue -j 16 /scratch/project_2001234
 
 # Machine-parsable output for scripting
 fue --csv /scratch/project_2001234 > usage.csv
@@ -124,6 +138,29 @@ When a cache is hit, the cache age is reported. In default mode this prints to
 stdout (`Cache loaded. Cache age: ...`); in `--csv` mode it is written to stderr
 (`Cache hit. Cache age: ...`) to keep stdout clean for parsing.
 
+### Per-directory breakdown
+
+With `--depth N`, `fue` instead prints one row per directory up to `N` levels
+below the target, indented under its parent and sorted largest first (by
+allocated size) among its siblings. Each row covers that directory's whole
+subtree, and the first row is the grand total:
+
+```
+  Allocated     Apparent        Files        Dirs   Denied  Path
+  ---------     --------        -----        ----   ------  ----
+   1.42 TiB     1.42 TiB      284,913      15,022       12  /scratch/project_2001234
+ 912.07 GiB   910.55 GiB      201,377       9,411        0    alice/
+ 655.20 GiB   654.98 GiB      150,102       6,001        0      simulations/
+ 256.87 GiB   255.57 GiB       51,275       3,409        0      analysis/
+ 541.71 GiB   541.10 GiB       83,536       5,610       12    bob/
+ ...
+```
+
+`Files` counts regular files; `Dirs` includes the directory itself. With
+`--csv` the breakdown is one row per directory, in the same order:
+`depth,path,total_size_bytes,total_blocks,reg_files,directories,symlinks,other,perm_denied_errors`.
+The cache stores only totals, so `--depth` always performs a fresh scan.
+
 ## Caching
 
 On each run `fue` resolves the target to its canonical path (`realpath()`) and
@@ -151,6 +188,10 @@ Caches do not expire automatically; delete the `fue_cache_*.bin` files (or use
 - With the default lazy-size mode, sizes reflect the MDT's possibly-stale view;
   use `--sync-size` for authoritative numbers at the cost of performance.
 - Individual paths longer than `PATH_MAX` (4096) are skipped with a warning.
+- Speedup from threads levels off once the metadata server (or local disk) is
+  saturated, typically somewhere around 8–16 threads. On shared systems, keep
+  `-j` modest so a scan doesn't overload the metadata server for other users.
+- With multiple threads, error and warning messages may appear in any order.
 
 ## References
 

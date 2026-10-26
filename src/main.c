@@ -13,6 +13,8 @@
 #include <time.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -31,6 +33,15 @@
 #ifndef AT_SYMLINK_NOFOLLOW
 #define AT_SYMLINK_NOFOLLOW 0x0100
 #endif
+
+/* Worker thread count.  Traversal is dominated by statx() latency (an MDT
+ * round-trip on Lustre), so a modest pool keeps several requests in flight
+ * without flooding the metadata server. */
+#define DEFAULT_THREADS 8
+#define MAX_THREADS     256
+
+/* Deepest --depth accepted; no path that fits in PATH_MAX can be deeper. */
+#define MAX_DEPTH (PATH_MAX / 2)
 
 /* Statistics container */
 struct stats {
@@ -167,131 +178,449 @@ void print_results(const char *canonical_path, uint64_t total_size, uint64_t tot
     }
 }
 
-/* A growable LIFO stack of heap-owned directory paths still to be visited.
- * Using an explicit stack keeps traversal depth off the C call stack, so deep
- * directory trees can no longer cause a stack overflow. */
+/* Add every counter in src into dst. */
+static void stats_add(struct stats *dst, const struct stats *src) {
+    dst->total_size += src->total_size;
+    dst->total_blocks += src->total_blocks;
+    dst->reg_count += src->reg_count;
+    dst->dir_count += src->dir_count;
+    dst->sym_count += src->sym_count;
+    dst->other_count += src->other_count;
+    dst->perm_denied_count += src->perm_denied_count;
+    dst->total_processed += src->total_processed;
+}
+
+/* Make room for one more element in a growable array, doubling its capacity
+ * when full.  Returns the (possibly moved) array, or NULL on allocation
+ * failure, in which case the original array is left untouched. */
+static void *grow_array(void *items, size_t *cap, size_t count, size_t elem_size) {
+    if (count < *cap) {
+        return items;
+    }
+    size_t new_cap = *cap == 0 ? 64 : *cap * 2;
+    void *new_items = realloc(items, new_cap * elem_size);
+    if (new_items) {
+        *cap = new_cap;
+    }
+    return new_items;
+}
+
+/* A directory still to be visited. */
+struct dir_item {
+    char *path;  /* heap-owned */
+    size_t node; /* breakdown node that this directory's contents count towards */
+    int depth;   /* levels below the traversal root, which is depth 0 */
+};
+
+/* A growable LIFO stack of directories still to be visited.  Using an explicit
+ * stack keeps traversal depth off the C call stack, so deep directory trees
+ * can no longer cause a stack overflow. */
 struct dir_stack {
-    char **items;
+    struct dir_item *items;
     size_t count;
     size_t cap;
 };
 
-/* Push a copy of path onto the stack.  Returns false on allocation failure. */
-static bool dir_stack_push(struct dir_stack *st, const char *path) {
-    if (st->count >= st->cap) {
-        size_t new_cap = st->cap == 0 ? 64 : st->cap * 2;
-        char **new_items = realloc(st->items, new_cap * sizeof(char *));
-        if (!new_items) {
-            return false;
-        }
-        st->items = new_items;
-        st->cap = new_cap;
-    }
-    char *copy = strdup(path);
-    if (!copy) {
+/* Push item onto the stack, taking ownership of its path on success.  Returns
+ * false on allocation failure (the caller still owns the path). */
+static bool dir_stack_push(struct dir_stack *st, struct dir_item item) {
+    struct dir_item *items = grow_array(st->items, &st->cap, st->count, sizeof(*items));
+    if (!items) {
         return false;
     }
-    st->items[st->count++] = copy;
+    st->items = items;
+    st->items[st->count++] = item;
     return true;
 }
 
-/* Pop the top path (transferring ownership to the caller), or NULL if empty. */
-static char *dir_stack_pop(struct dir_stack *st) {
+/* Pop the top item (transferring ownership of its path), or return false if empty. */
+static bool dir_stack_pop(struct dir_stack *st, struct dir_item *out) {
     if (st->count == 0) {
-        return NULL;
+        return false;
     }
-    return st->items[--st->count];
+    *out = st->items[--st->count];
+    return true;
 }
 
-/* Iterative traversal logic.  Visits the tree rooted at root_path depth-first
- * using an explicit stack rather than recursion. */
-void traverse(const char *root_path, struct stats *s, int flags_statx, bool show_progress) {
-    struct dir_stack stack = {0};
-    if (!dir_stack_push(&stack, root_path)) {
-        fprintf(stderr, "Memory allocation error\n");
+/* One directory in the --depth breakdown.  Every directory at most max_depth
+ * levels below the root gets a node; anything deeper is counted towards its
+ * nearest ancestor that has one.  Without --depth only the root has a node. */
+struct dir_node {
+    char *path;     /* heap-owned */
+    size_t parent;  /* index of the parent node (unused for the root, node 0) */
+    int depth;
+    struct stats s; /* this directory's own entries, or its whole subtree once rolled up */
+};
+
+struct dir_tree {
+    struct dir_node *nodes;
+    size_t count;
+    size_t cap;
+};
+
+/* Append a node holding a copy of path.  Returns its index, or SIZE_MAX on
+ * allocation failure. */
+static size_t dir_tree_add(struct dir_tree *t, const char *path, size_t parent, int depth,
+                           const struct stats *s) {
+    struct dir_node *nodes = grow_array(t->nodes, &t->cap, t->count, sizeof(*nodes));
+    if (!nodes) {
+        return SIZE_MAX;
+    }
+    t->nodes = nodes;
+    char *copy = strdup(path);
+    if (!copy) {
+        return SIZE_MAX;
+    }
+    t->nodes[t->count] = (struct dir_node){copy, parent, depth, *s};
+    return t->count++;
+}
+
+static void dir_tree_free(struct dir_tree *t) {
+    for (size_t i = 0; i < t->count; i++) {
+        free(t->nodes[i].path);
+    }
+    free(t->nodes);
+}
+
+/* State shared by all worker threads.  The traversal is finished once the
+ * stack is empty and no worker is still scanning a directory (which could
+ * otherwise push more work).  stack, tree and active are guarded by lock. */
+struct work_queue {
+    struct dir_stack stack;
+    struct dir_tree tree;
+    size_t active;                  /* workers currently scanning a directory */
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    atomic_uint_fast64_t processed; /* global entry count, for --progress only */
+    int flags_statx;
+    bool show_progress;
+    int max_depth;
+};
+
+/* Count subdirectory name of dir (whose own inode is stx) and queue it on
+ * found.  Within the --depth breakdown the subdirectory gets a node of its
+ * own, which its inode counts towards; otherwise it is counted into s along
+ * with the rest of dir. */
+static void visit_subdir(struct work_queue *q, const struct dir_item *dir, const char *name,
+                         const struct statx *stx, struct stats *s, struct dir_stack *found) {
+    struct stats self = {
+        .total_size = stx->stx_size,
+        .total_blocks = stx->stx_blocks,
+        .dir_count = 1,
+        .total_processed = 1,
+    };
+
+    char subpath[PATH_MAX];
+    int len = snprintf(subpath, sizeof(subpath), "%s/%s", dir->path, name);
+    if (len >= (int)sizeof(subpath)) {
+        fprintf(stderr, "Warning: Path too long, skipping subdirectory: %s/%s\n", dir->path, name);
+        stats_add(s, &self);
         return;
     }
 
-    char *path;
-    while ((path = dir_stack_pop(&stack)) != NULL) {
-        DIR *dir = opendir(path);
-        if (!dir) {
+    struct dir_item sub = {.node = dir->node, .depth = dir->depth + 1};
+    if (sub.depth <= q->max_depth) {
+        pthread_mutex_lock(&q->lock);
+        size_t node = dir_tree_add(&q->tree, subpath, dir->node, sub.depth, &self);
+        pthread_mutex_unlock(&q->lock);
+        if (node != SIZE_MAX) {
+            sub.node = node;
+        } else {
+            fprintf(stderr, "Memory allocation error\n");
+            stats_add(s, &self);
+        }
+    } else {
+        stats_add(s, &self);
+    }
+
+    /* Queue the subdirectory for a later iteration. */
+    sub.path = strdup(subpath);
+    if (!sub.path || !dir_stack_push(found, sub)) {
+        fprintf(stderr, "Memory allocation error\n");
+        free(sub.path);
+    }
+}
+
+/* Read one directory, counting its entries into s and pushing any
+ * subdirectories onto found for a later visit. */
+static void scan_directory(struct work_queue *q, const struct dir_item *dir, struct stats *s,
+                           struct dir_stack *found) {
+    DIR *dirp = opendir(dir->path);
+    if (!dirp) {
+        if (errno == EACCES) {
+            s->perm_denied_count++;
+        } else {
+            fprintf(stderr, "Error opening directory %s: %s\n", dir->path, strerror(errno));
+        }
+        return;
+    }
+
+    int dfd = dirfd(dirp);
+    if (dfd < 0) {
+        fprintf(stderr, "Error acquiring file descriptor for %s: %s\n", dir->path, strerror(errno));
+        closedir(dirp);
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dirp)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        struct statx stx;
+        if (statx(dfd, entry->d_name, AT_SYMLINK_NOFOLLOW | q->flags_statx,
+                  STATX_TYPE | STATX_SIZE | STATX_BLOCKS, &stx) != 0) {
             if (errno == EACCES) {
                 s->perm_denied_count++;
             } else {
-                fprintf(stderr, "Error opening directory %s: %s\n", path, strerror(errno));
+                fprintf(stderr, "Error querying %s/%s: %s\n", dir->path, entry->d_name, strerror(errno));
             }
-            free(path);
             continue;
         }
 
-        int dfd = dirfd(dir);
-        if (dfd < 0) {
-            fprintf(stderr, "Error acquiring file descriptor for %s: %s\n", path, strerror(errno));
-            closedir(dir);
-            free(path);
-            continue;
-        }
-
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-
-            struct statx stx;
-            if (statx(dfd, entry->d_name, AT_SYMLINK_NOFOLLOW | flags_statx,
-                      STATX_TYPE | STATX_SIZE | STATX_BLOCKS, &stx) != 0) {
-                if (errno == EACCES) {
-                    s->perm_denied_count++;
-                } else {
-                    fprintf(stderr, "Error querying %s/%s: %s\n", path, entry->d_name, strerror(errno));
-                }
-                continue;
-            }
-
-            s->total_size += stx.stx_size;
-            s->total_blocks += stx.stx_blocks;
-            s->total_processed++;
-
-            if (show_progress && (s->total_processed % 100 == 0)) {
+        if (q->show_progress) {
+            uint64_t n = atomic_fetch_add_explicit(&q->processed, 1, memory_order_relaxed) + 1;
+            if (n % 100 == 0) {
                 char processed_str[32];
-                format_commas(s->total_processed, processed_str, sizeof(processed_str));
+                format_commas(n, processed_str, sizeof(processed_str));
                 fprintf(stderr, "\rProcessed: %s files/directories...", processed_str);
                 fflush(stderr);
             }
+        }
 
-            if (S_ISLNK(stx.stx_mode)) {
-                s->sym_count++;
-            } else if (S_ISREG(stx.stx_mode)) {
-                s->reg_count++;
-            } else if (S_ISDIR(stx.stx_mode)) {
-                s->dir_count++;
+        if (S_ISDIR(stx.stx_mode)) {
+            visit_subdir(q, dir, entry->d_name, &stx, s, found);
+            continue;
+        }
 
-                /* Build the child path and queue it for a later iteration. */
-                char subpath[PATH_MAX];
-                int len = snprintf(subpath, sizeof(subpath), "%s/%s", path, entry->d_name);
-                if (len >= (int)sizeof(subpath)) {
-                    fprintf(stderr, "Warning: Path too long, skipping subdirectory: %s/%s\n",
-                            path, entry->d_name);
-                    continue;
-                }
-                if (!dir_stack_push(&stack, subpath)) {
-                    fprintf(stderr, "Memory allocation error\n");
-                }
-            } else {
-                s->other_count++;
+        s->total_size += stx.stx_size;
+        s->total_blocks += stx.stx_blocks;
+        s->total_processed++;
+
+        if (S_ISLNK(stx.stx_mode)) {
+            s->sym_count++;
+        } else if (S_ISREG(stx.stx_mode)) {
+            s->reg_count++;
+        } else {
+            s->other_count++;
+        }
+    }
+    closedir(dirp); /* Closed immediately to minimize concurrent FD usage */
+}
+
+/* Worker loop: repeatedly take a directory from the shared queue, scan it,
+ * then hand its totals and any subdirectories it found back in one batch. */
+static void *traverse_worker(void *arg) {
+    struct work_queue *q = arg;
+    struct dir_stack found = {0};
+
+    for (;;) {
+        struct dir_item dir;
+        pthread_mutex_lock(&q->lock);
+        while (q->stack.count == 0 && q->active > 0) {
+            pthread_cond_wait(&q->cond, &q->lock);
+        }
+        if (!dir_stack_pop(&q->stack, &dir)) {
+            /* Nothing queued and nobody left to queue more: we are done. */
+            pthread_mutex_unlock(&q->lock);
+            break;
+        }
+        q->active++;
+        pthread_mutex_unlock(&q->lock);
+
+        struct stats s = {0};
+        scan_directory(q, &dir, &s, &found);
+        free(dir.path);
+
+        pthread_mutex_lock(&q->lock);
+        stats_add(&q->tree.nodes[dir.node].s, &s);
+        size_t new_work = found.count;
+        for (size_t i = 0; i < found.count; i++) {
+            if (!dir_stack_push(&q->stack, found.items[i])) {
+                fprintf(stderr, "Memory allocation error\n");
+                free(found.items[i].path);
             }
         }
-        closedir(dir); /* Closed immediately to minimize concurrent FD usage */
-        free(path);
+        found.count = 0;
+        q->active--;
+        /* Wake idle workers for the new directories, or so they can all
+         * observe that the traversal has just finished. */
+        if (new_work > 0 || q->active == 0) {
+            pthread_cond_broadcast(&q->cond);
+        }
+        pthread_mutex_unlock(&q->lock);
     }
 
-    /* Free any paths still queued (only reachable on allocation failure). */
-    for (size_t i = 0; i < stack.count; i++) {
-        free(stack.items[i]);
+    free(found.items);
+    return NULL;
+}
+
+/* Parallel iterative traversal of the directory root_path, whose own inode is
+ * already counted in s.  nthreads workers (the calling thread is one of them)
+ * share a stack of pending directories.  On success, tree holds a node for
+ * every directory at most max_depth levels below the root (node 0 is the
+ * root itself), each carrying the totals of its whole subtree, and s holds the
+ * grand total.  The caller must free tree with dir_tree_free(). */
+bool traverse(const char *root_path, struct stats *s, int flags_statx, bool show_progress,
+              int nthreads, int max_depth, struct dir_tree *tree) {
+    struct work_queue q = {0};
+    q.flags_statx = flags_statx;
+    q.show_progress = show_progress;
+    q.max_depth = max_depth;
+
+    /* The root inode is already in s, so the root node starts empty. */
+    const struct stats empty = {0};
+    pthread_t *tids = calloc((size_t)nthreads, sizeof(*tids));
+    struct dir_item root = {strdup(root_path), 0, 0};
+    if (!tids || !root.path || dir_tree_add(&q.tree, root_path, 0, 0, &empty) == SIZE_MAX ||
+        !dir_stack_push(&q.stack, root)) {
+        fprintf(stderr, "Memory allocation error\n");
+        free(tids);
+        free(root.path);
+        free(q.stack.items);
+        dir_tree_free(&q.tree);
+        return false;
     }
-    free(stack.items);
+    pthread_mutex_init(&q.lock, NULL);
+    pthread_cond_init(&q.cond, NULL);
+    atomic_init(&q.processed, s->total_processed);
+
+    /* Worker 0 runs on this thread; failing to spawn extras only costs speed. */
+    int started = 1;
+    for (; started < nthreads; started++) {
+        int err = pthread_create(&tids[started], NULL, traverse_worker, &q);
+        if (err != 0) {
+            fprintf(stderr, "Warning: Could only start %d of %d threads: %s\n",
+                    started, nthreads, strerror(err));
+            break;
+        }
+    }
+    traverse_worker(&q);
+    for (int i = 1; i < started; i++) {
+        pthread_join(tids[i], NULL);
+    }
+
+    /* Roll every node up into its parent.  A node is always added after its
+     * parent, so walking backwards completes each subtree before it is added. */
+    for (size_t i = q.tree.count - 1; i > 0; i--) {
+        stats_add(&q.tree.nodes[q.tree.nodes[i].parent].s, &q.tree.nodes[i].s);
+    }
+    stats_add(s, &q.tree.nodes[0].s);
+    q.tree.nodes[0].s = *s;
+    *tree = q.tree;
+
+    free(q.stack.items); /* Workers only exit once the stack is empty. */
+    free(tids);
+    pthread_cond_destroy(&q.cond);
+    pthread_mutex_destroy(&q.lock);
+    return true;
+}
+
+/* qsort() has no context argument, so cmp_nodes() reads the nodes from here. */
+static const struct dir_node *sort_nodes;
+
+/* Order node indices by parent, then by allocated size (largest first), so
+ * the children of each node end up contiguous and sorted. */
+static int cmp_nodes(const void *a, const void *b) {
+    const struct dir_node *x = &sort_nodes[*(const size_t *)a];
+    const struct dir_node *y = &sort_nodes[*(const size_t *)b];
+    if (x->parent != y->parent) {
+        return x->parent < y->parent ? -1 : 1;
+    }
+    if (x->s.total_blocks != y->s.total_blocks) {
+        return x->s.total_blocks > y->s.total_blocks ? -1 : 1;
+    }
+    return strcmp(x->path, y->path);
+}
+
+/* Print the --depth breakdown: every node in depth-first order, each
+ * directory's children largest first.  The human-readable form indents names
+ * under their parent; CSV gives one row per directory with its full path. */
+void print_breakdown(const struct dir_tree *t, bool csv_mode) {
+    size_t n = t->count;
+    size_t *order = malloc(n * sizeof(*order));     /* non-root nodes, sorted */
+    size_t *first = calloc(n, sizeof(*first));      /* position in order of each node's first child */
+    size_t *nchildren = calloc(n, sizeof(*nchildren));
+    size_t *stack = malloc(n * sizeof(*stack));
+    if (!order || !first || !nchildren || !stack) {
+        fprintf(stderr, "Memory allocation error\n");
+        goto out;
+    }
+
+    for (size_t i = 1; i < n; i++) {
+        order[i - 1] = i;
+    }
+    sort_nodes = t->nodes;
+    qsort(order, n - 1, sizeof(*order), cmp_nodes);
+    for (size_t k = 0; k + 1 < n; k++) {
+        size_t parent = t->nodes[order[k]].parent;
+        if (nchildren[parent]++ == 0) {
+            first[parent] = k;
+        }
+    }
+
+    if (csv_mode) {
+        printf("depth,path,total_size_bytes,total_blocks,reg_files,directories,symlinks,other,perm_denied_errors\n");
+    } else {
+        printf("%11s  %11s  %11s  %10s  %7s  %s\n",
+               "Allocated", "Apparent", "Files", "Dirs", "Denied", "Path");
+        printf("%11s  %11s  %11s  %10s  %7s  %s\n",
+               "---------", "--------", "-----", "----", "------", "----");
+    }
+
+    /* Depth-first walk; push children in reverse so the largest pops first. */
+    size_t top = 0;
+    stack[top++] = 0;
+    while (top > 0) {
+        size_t i = stack[--top];
+        const struct dir_node *d = &t->nodes[i];
+        for (size_t c = nchildren[i]; c-- > 0;) {
+            stack[top++] = order[first[i] + c];
+        }
+
+        if (csv_mode) {
+            printf("%d,\"%s\",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                   d->depth, d->path, d->s.total_size, d->s.total_blocks, d->s.reg_count,
+                   d->s.dir_count, d->s.sym_count, d->s.other_count, d->s.perm_denied_count);
+            continue;
+        }
+
+        char alloc_buf[64], size_buf[64], files_buf[32], dirs_buf[32], denied_buf[32];
+        format_size(d->s.total_blocks * 512, alloc_buf, sizeof(alloc_buf));
+        format_size(d->s.total_size, size_buf, sizeof(size_buf));
+        format_commas(d->s.reg_count, files_buf, sizeof(files_buf));
+        format_commas(d->s.dir_count, dirs_buf, sizeof(dirs_buf));
+        format_commas(d->s.perm_denied_count, denied_buf, sizeof(denied_buf));
+        const char *name = d->depth == 0 ? d->path : strrchr(d->path, '/') + 1;
+        printf("%11s  %11s  %11s  %10s  %7s  %*s%s%s\n",
+               alloc_buf, size_buf, files_buf, dirs_buf, denied_buf,
+               2 * d->depth, "", name, d->depth > 0 ? "/" : "");
+    }
+
+    if (!csv_mode && t->nodes[0].s.perm_denied_count > 0) {
+        printf("\nDenied counts entries that could not be read (permission denied);\n"
+               "totals that include them are undercounts.\n");
+    }
+
+out:
+    free(order);
+    free(first);
+    free(nchildren);
+    free(stack);
+}
+
+/* Parse an integer option argument.  Returns false unless it is an integer in
+ * [min, max]. */
+static bool parse_int_option(const char *arg, long min, long max, int *out) {
+    char *end;
+    errno = 0;
+    long val = strtol(arg, &end, 10);
+    if (errno != 0 || end == arg || *end != '\0' || val < min || val > max) {
+        return false;
+    }
+    *out = (int)val;
+    return true;
 }
 
 int main(int argc, char *argv[]) {
@@ -299,6 +628,8 @@ int main(int argc, char *argv[]) {
     bool sync_size = false;
     bool no_cache = false;
     bool show_progress = false;
+    int nthreads = DEFAULT_THREADS;
+    int max_depth = 0;
     const char *input_path = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -310,6 +641,19 @@ int main(int argc, char *argv[]) {
             no_cache = true;
         } else if (strcmp(argv[i], "--progress") == 0) {
             show_progress = true;
+        } else if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc || !parse_int_option(argv[i + 1], 1, MAX_THREADS, &nthreads)) {
+                fprintf(stderr, "Error: %s requires a thread count from 1 to %d.\n",
+                        argv[i], MAX_THREADS);
+                return 1;
+            }
+            i++;
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--depth") == 0) {
+            if (i + 1 >= argc || !parse_int_option(argv[i + 1], 1, MAX_DEPTH, &max_depth)) {
+                fprintf(stderr, "Error: %s requires a depth from 1 to %d.\n", argv[i], MAX_DEPTH);
+                return 1;
+            }
+            i++;
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("fue %s\n", FUE_VERSION);
             return 0;
@@ -317,12 +661,14 @@ int main(int argc, char *argv[]) {
             printf("Disk Usage Analyzer (optimized via statx)\n");
             printf("Usage: %s [options] <path>\n\n", argv[0]);
             printf("Options:\n");
-            printf("  --csv          Output in parsable CSV format\n");
-            printf("  --sync-size    Toggle AT_STATX_DONT_SYNC off for accurate synchronization\n");
-            printf("  --no-cache     Do not read cache files\n");
-            printf("  --progress     Display a live file counter\n");
-            printf("  --version      Show version information\n");
-            printf("  -h, --help     Show this message\n");
+            printf("  --csv            Output in parsable CSV format\n");
+            printf("  --sync-size      Toggle AT_STATX_DONT_SYNC off for accurate synchronization\n");
+            printf("  --no-cache       Do not read cache files\n");
+            printf("  --progress       Display a live file counter\n");
+            printf("  -j, --threads N  Scan with N parallel threads (default %d)\n", DEFAULT_THREADS);
+            printf("  -d, --depth N    Break usage down by directory, N levels deep\n");
+            printf("  --version        Show version information\n");
+            printf("  -h, --help       Show this message\n");
             return 0;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -364,7 +710,8 @@ int main(int argc, char *argv[]) {
     char cache_filepath[PATH_MAX];
     snprintf(cache_filepath, sizeof(cache_filepath), "%s/fue_cache_%016llx.bin", tmpdir, (unsigned long long)path_hash);
 
-    if (!no_cache) {
+    /* The cache only holds totals, so a --depth breakdown always rescans. */
+    if (!no_cache && max_depth == 0) {
         /* Open securely using O_NOFOLLOW to mitigate symlink vulnerabilities */
         int fd = open(cache_filepath, O_RDONLY | O_NOFOLLOW);
         if (fd >= 0) {
@@ -396,6 +743,7 @@ int main(int argc, char *argv[]) {
 
     /* Traversal Execution */
     struct stats s = {0};
+    struct dir_tree tree = {0};
     struct statx target_stx;
     if (statx(AT_FDCWD, canonical_path, AT_SYMLINK_NOFOLLOW | flags_statx, 
               STATX_TYPE | STATX_SIZE | STATX_BLOCKS, &target_stx) != 0) {
@@ -419,7 +767,9 @@ int main(int argc, char *argv[]) {
         s.reg_count++;
     } else if (S_ISDIR(target_stx.stx_mode)) {
         s.dir_count++;
-        traverse(canonical_path, &s, flags_statx, show_progress);
+        if (!traverse(canonical_path, &s, flags_statx, show_progress, nthreads, max_depth, &tree)) {
+            return 1;
+        }
     } else {
         s.other_count++;
     }
@@ -431,8 +781,13 @@ int main(int argc, char *argv[]) {
     }
 
     /* Output Final Results */
-    print_results(canonical_path, s.total_size, s.total_blocks, s.reg_count, 
-                  s.dir_count, s.sym_count, s.other_count, s.perm_denied_count, csv_mode);
+    if (max_depth > 0 && tree.count > 0) {
+        print_breakdown(&tree, csv_mode);
+    } else {
+        print_results(canonical_path, s.total_size, s.total_blocks, s.reg_count, 
+                      s.dir_count, s.sym_count, s.other_count, s.perm_denied_count, csv_mode);
+    }
+    dir_tree_free(&tree);
 
     /* Write Cache results */
     struct cache_data cache;

@@ -22,6 +22,9 @@ CFLAGS      = -O2 -g -std=c11 -Wall -Wextra
 LDFLAGS     =
 LDLIBS      =
 
+# Flags the build requires regardless of the user's CFLAGS.
+PTHREAD_FLAGS = -pthread
+
 # Installation directories (GNU standard).  These are overridable, and
 # DESTDIR is honored for staged installs (e.g. packaging).
 prefix      = /usr/local
@@ -44,7 +47,7 @@ all: $(PROGRAM)
 
 # Link the executable.
 $(PROGRAM): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(CC) $(PTHREAD_FLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 # Version string baked into the binary at compile time.
 VERSION_DEF = -DFUE_VERSION='"$(VERSION)"'
@@ -52,7 +55,7 @@ VERSION_DEF = -DFUE_VERSION='"$(VERSION)"'
 # Compile objects.  Pattern rule mirrors the built-in GNU rule but is
 # spelled out for clarity.
 $(srcdir)/%.o: $(srcdir)/%.c
-	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(PTHREAD_FLAGS) $(CFLAGS) -c -o $@ $<
 
 # Install / uninstall.
 .PHONY: install
