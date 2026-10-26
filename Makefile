@@ -25,6 +25,13 @@ LDLIBS      =
 # Flags the build requires regardless of the user's CFLAGS.
 PTHREAD_FLAGS = -pthread
 
+# The interactive browser (--tui) needs ncursesw.  Build with WITH_TUI=no to
+# leave it out on systems without the ncurses headers (run "make clean" first
+# when switching).
+WITH_TUI       = yes
+NCURSES_CFLAGS = $(shell pkg-config --cflags ncursesw 2>/dev/null)
+NCURSES_LIBS   = $(shell pkg-config --libs ncursesw 2>/dev/null || echo -lncursesw)
+
 # Installation directories (GNU standard).  These are overridable, and
 # DESTDIR is honored for staged installs (e.g. packaging).
 prefix      = /usr/local
@@ -38,8 +45,16 @@ man1dir     = $(mandir)/man1
 # Project layout
 srcdir      = src
 SRCS        = $(srcdir)/main.c
-OBJS        = $(SRCS:.c=.o)
+HEADERS     = $(srcdir)/fue.h
 PROGRAM     = $(PACKAGE)
+
+ifeq ($(WITH_TUI),yes)
+SRCS       += $(srcdir)/tui.c
+TUI_LIBS    = $(NCURSES_LIBS)
+else
+TUI_DEFS    = -DFUE_NO_TUI
+endif
+OBJS        = $(SRCS:.c=.o)
 
 # Default target.
 .PHONY: all
@@ -47,15 +62,17 @@ all: $(PROGRAM)
 
 # Link the executable.
 $(PROGRAM): $(OBJS)
-	$(CC) $(PTHREAD_FLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+	$(CC) $(PTHREAD_FLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(TUI_LIBS) $(LDLIBS)
 
 # Version string baked into the binary at compile time.
 VERSION_DEF = -DFUE_VERSION='"$(VERSION)"'
 
 # Compile objects.  Pattern rule mirrors the built-in GNU rule but is
 # spelled out for clarity.
-$(srcdir)/%.o: $(srcdir)/%.c
-	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(PTHREAD_FLAGS) $(CFLAGS) -c -o $@ $<
+$(srcdir)/%.o: $(srcdir)/%.c $(HEADERS)
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(TUI_DEFS) $(EXTRA_CPPFLAGS) $(PTHREAD_FLAGS) $(CFLAGS) -c -o $@ $<
+
+$(srcdir)/tui.o: EXTRA_CPPFLAGS = $(NCURSES_CFLAGS)
 
 # Install / uninstall.
 .PHONY: install
@@ -74,7 +91,7 @@ uninstall:
 # Cleanup targets.
 .PHONY: clean
 clean:
-	$(RM) $(OBJS) $(PROGRAM)
+	$(RM) $(srcdir)/*.o $(PROGRAM)
 
 .PHONY: distclean
 distclean: clean

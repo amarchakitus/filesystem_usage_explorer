@@ -16,6 +16,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+#include "fue.h"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -42,18 +44,6 @@
 
 /* Deepest --depth accepted; no path that fits in PATH_MAX can be deeper. */
 #define MAX_DEPTH (PATH_MAX / 2)
-
-/* Statistics container */
-struct stats {
-    uint64_t total_size;
-    uint64_t total_blocks;
-    uint64_t reg_count;
-    uint64_t dir_count;
-    uint64_t sym_count;
-    uint64_t other_count;
-    uint64_t perm_denied_count;
-    uint64_t total_processed;
-};
 
 /* Cache file format identity. Bump CACHE_VERSION whenever the on-disk layout or
  * the semantics of any cached field change, so older incompatible cache files
@@ -242,32 +232,16 @@ static bool dir_stack_pop(struct dir_stack *st, struct dir_item *out) {
     return true;
 }
 
-/* One directory in the --depth breakdown.  Every directory at most max_depth
- * levels below the root gets a node; anything deeper is counted towards its
- * nearest ancestor that has one.  Without --depth only the root has a node. */
-struct dir_node {
-    char *path;     /* heap-owned */
-    size_t parent;  /* index of the parent node (unused for the root, node 0) */
-    int depth;
-    struct stats s; /* this directory's own entries, or its whole subtree once rolled up */
-};
-
-struct dir_tree {
-    struct dir_node *nodes;
-    size_t count;
-    size_t cap;
-};
-
-/* Append a node holding a copy of path.  Returns its index, or SIZE_MAX on
+/* Append a node holding a copy of name.  Returns its index, or SIZE_MAX on
  * allocation failure. */
-static size_t dir_tree_add(struct dir_tree *t, const char *path, size_t parent, int depth,
+static size_t dir_tree_add(struct dir_tree *t, const char *name, size_t parent, int depth,
                            const struct stats *s) {
     struct dir_node *nodes = grow_array(t->nodes, &t->cap, t->count, sizeof(*nodes));
     if (!nodes) {
         return SIZE_MAX;
     }
     t->nodes = nodes;
-    char *copy = strdup(path);
+    char *copy = strdup(name);
     if (!copy) {
         return SIZE_MAX;
     }
@@ -275,9 +249,41 @@ static size_t dir_tree_add(struct dir_tree *t, const char *path, size_t parent, 
     return t->count++;
 }
 
+/* Write the full path of node i into buf.  Nodes only store their own name
+ * (which keeps a whole-tree scan small), so the path is rebuilt from node i
+ * up to the root. */
+void dir_tree_path(const struct dir_tree *t, size_t i, char *buf, size_t size) {
+    char tmp[PATH_MAX];
+    size_t pos = sizeof(tmp) - 1;
+    tmp[pos] = '\0';
+    for (;;) {
+        const char *name = t->nodes[i].name;
+        size_t len = strlen(name);
+        if (len > pos) {
+            break;
+        }
+        pos -= len;
+        memcpy(tmp + pos, name, len);
+        if (i == 0) {
+            break;
+        }
+        i = t->nodes[i].parent;
+        /* Avoid "//usr" when the root itself is "/". */
+        const char *parent = t->nodes[i].name;
+        bool parent_ends_in_slash = i == 0 && parent[strlen(parent) - 1] == '/';
+        if (!parent_ends_in_slash) {
+            if (pos == 0) {
+                break;
+            }
+            tmp[--pos] = '/';
+        }
+    }
+    snprintf(buf, size, "%s", tmp + pos);
+}
+
 static void dir_tree_free(struct dir_tree *t) {
     for (size_t i = 0; i < t->count; i++) {
-        free(t->nodes[i].path);
+        free(t->nodes[i].name);
     }
     free(t->nodes);
 }
@@ -321,7 +327,7 @@ static void visit_subdir(struct work_queue *q, const struct dir_item *dir, const
     struct dir_item sub = {.node = dir->node, .depth = dir->depth + 1};
     if (sub.depth <= q->max_depth) {
         pthread_mutex_lock(&q->lock);
-        size_t node = dir_tree_add(&q->tree, subpath, dir->node, sub.depth, &self);
+        size_t node = dir_tree_add(&q->tree, name, dir->node, sub.depth, &self);
         pthread_mutex_unlock(&q->lock);
         if (node != SIZE_MAX) {
             sub.node = node;
@@ -531,33 +537,51 @@ static int cmp_nodes(const void *a, const void *b) {
     if (x->s.total_blocks != y->s.total_blocks) {
         return x->s.total_blocks > y->s.total_blocks ? -1 : 1;
     }
-    return strcmp(x->path, y->path);
+    return strcmp(x->name, y->name);
+}
+
+/* Index the children of every node in t.  Returns false on allocation failure. */
+bool dir_index_build(const struct dir_tree *t, struct dir_index *ix) {
+    size_t n = t->count;
+    ix->order = malloc(n * sizeof(*ix->order)); /* non-root nodes, sorted */
+    ix->first = calloc(n, sizeof(*ix->first));
+    ix->nchildren = calloc(n, sizeof(*ix->nchildren));
+    if (!ix->order || !ix->first || !ix->nchildren) {
+        dir_index_free(ix);
+        return false;
+    }
+
+    for (size_t i = 1; i < n; i++) {
+        ix->order[i - 1] = i;
+    }
+    sort_nodes = t->nodes;
+    qsort(ix->order, n - 1, sizeof(*ix->order), cmp_nodes);
+    for (size_t k = 0; k + 1 < n; k++) {
+        size_t parent = t->nodes[ix->order[k]].parent;
+        if (ix->nchildren[parent]++ == 0) {
+            ix->first[parent] = k;
+        }
+    }
+    return true;
+}
+
+void dir_index_free(struct dir_index *ix) {
+    free(ix->order);
+    free(ix->first);
+    free(ix->nchildren);
+    *ix = (struct dir_index){0};
 }
 
 /* Print the --depth breakdown: every node in depth-first order, each
  * directory's children largest first.  The human-readable form indents names
  * under their parent; CSV gives one row per directory with its full path. */
 void print_breakdown(const struct dir_tree *t, bool csv_mode) {
-    size_t n = t->count;
-    size_t *order = malloc(n * sizeof(*order));     /* non-root nodes, sorted */
-    size_t *first = calloc(n, sizeof(*first));      /* position in order of each node's first child */
-    size_t *nchildren = calloc(n, sizeof(*nchildren));
-    size_t *stack = malloc(n * sizeof(*stack));
-    if (!order || !first || !nchildren || !stack) {
+    struct dir_index ix;
+    size_t *stack = malloc(t->count * sizeof(*stack));
+    if (!stack || !dir_index_build(t, &ix)) {
         fprintf(stderr, "Memory allocation error\n");
-        goto out;
-    }
-
-    for (size_t i = 1; i < n; i++) {
-        order[i - 1] = i;
-    }
-    sort_nodes = t->nodes;
-    qsort(order, n - 1, sizeof(*order), cmp_nodes);
-    for (size_t k = 0; k + 1 < n; k++) {
-        size_t parent = t->nodes[order[k]].parent;
-        if (nchildren[parent]++ == 0) {
-            first[parent] = k;
-        }
+        free(stack);
+        return;
     }
 
     if (csv_mode) {
@@ -575,13 +599,15 @@ void print_breakdown(const struct dir_tree *t, bool csv_mode) {
     while (top > 0) {
         size_t i = stack[--top];
         const struct dir_node *d = &t->nodes[i];
-        for (size_t c = nchildren[i]; c-- > 0;) {
-            stack[top++] = order[first[i] + c];
+        for (size_t c = ix.nchildren[i]; c-- > 0;) {
+            stack[top++] = ix.order[ix.first[i] + c];
         }
 
         if (csv_mode) {
+            char path[PATH_MAX];
+            dir_tree_path(t, i, path, sizeof(path));
             printf("%d,\"%s\",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-                   d->depth, d->path, d->s.total_size, d->s.total_blocks, d->s.reg_count,
+                   d->depth, path, d->s.total_size, d->s.total_blocks, d->s.reg_count,
                    d->s.dir_count, d->s.sym_count, d->s.other_count, d->s.perm_denied_count);
             continue;
         }
@@ -592,10 +618,9 @@ void print_breakdown(const struct dir_tree *t, bool csv_mode) {
         format_commas(d->s.reg_count, files_buf, sizeof(files_buf));
         format_commas(d->s.dir_count, dirs_buf, sizeof(dirs_buf));
         format_commas(d->s.perm_denied_count, denied_buf, sizeof(denied_buf));
-        const char *name = d->depth == 0 ? d->path : strrchr(d->path, '/') + 1;
         printf("%11s  %11s  %11s  %10s  %7s  %*s%s%s\n",
                alloc_buf, size_buf, files_buf, dirs_buf, denied_buf,
-               2 * d->depth, "", name, d->depth > 0 ? "/" : "");
+               2 * d->depth, "", d->name, d->depth > 0 ? "/" : "");
     }
 
     if (!csv_mode && t->nodes[0].s.perm_denied_count > 0) {
@@ -603,10 +628,7 @@ void print_breakdown(const struct dir_tree *t, bool csv_mode) {
                "totals that include them are undercounts.\n");
     }
 
-out:
-    free(order);
-    free(first);
-    free(nchildren);
+    dir_index_free(&ix);
     free(stack);
 }
 
@@ -630,6 +652,7 @@ int main(int argc, char *argv[]) {
     bool show_progress = false;
     int nthreads = DEFAULT_THREADS;
     int max_depth = 0;
+    bool tui_mode = false;
     const char *input_path = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -654,6 +677,8 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             i++;
+        } else if (strcmp(argv[i], "--tui") == 0) {
+            tui_mode = true;
         } else if (strcmp(argv[i], "--version") == 0) {
             printf("fue %s\n", FUE_VERSION);
             return 0;
@@ -667,6 +692,7 @@ int main(int argc, char *argv[]) {
             printf("  --progress       Display a live file counter\n");
             printf("  -j, --threads N  Scan with N parallel threads (default %d)\n", DEFAULT_THREADS);
             printf("  -d, --depth N    Break usage down by directory, N levels deep\n");
+            printf("  --tui            Browse the results interactively (read-only)\n");
             printf("  --version        Show version information\n");
             printf("  -h, --help       Show this message\n");
             return 0;
@@ -685,6 +711,26 @@ int main(int argc, char *argv[]) {
     if (!input_path) {
         fprintf(stderr, "Error: Missing target path parameter.\n");
         return 1;
+    }
+
+    if (tui_mode) {
+#ifdef FUE_NO_TUI
+        fprintf(stderr, "Error: This fue was built without --tui support.\n");
+        return 1;
+#else
+        if (csv_mode) {
+            fprintf(stderr, "Error: --tui cannot be combined with --csv.\n");
+            return 1;
+        }
+        if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+            fprintf(stderr, "Error: --tui needs an interactive terminal.\n");
+            return 1;
+        }
+        /* The browser can descend anywhere, so keep every directory, and show
+         * progress during what may be a long scan. */
+        max_depth = MAX_DEPTH;
+        show_progress = isatty(STDERR_FILENO);
+#endif
     }
 
     /* Standardize path format using realpath() */
@@ -781,7 +827,15 @@ int main(int argc, char *argv[]) {
     }
 
     /* Output Final Results */
-    if (max_depth > 0 && tree.count > 0) {
+    if (tui_mode && tree.count > 0) {
+#ifndef FUE_NO_TUI
+        if (!run_tui(&tree, flags_statx)) {
+            fprintf(stderr, "Error: Could not start the terminal interface.\n");
+            dir_tree_free(&tree);
+            return 1;
+        }
+#endif
+    } else if (max_depth > 0 && tree.count > 0) {
         print_breakdown(&tree, csv_mode);
     } else {
         print_results(canonical_path, s.total_size, s.total_blocks, s.reg_count, 

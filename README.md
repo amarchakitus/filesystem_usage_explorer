@@ -31,13 +31,17 @@ results so repeated queries on the same path return instantly.
   machine-parsable CSV with `--csv`.
 - **Per-directory breakdown** — `--depth N` reports usage for every directory
   up to `N` levels below the target, from a single traversal.
+- **Interactive browser** — `--tui` scans once, then lets you navigate the tree
+  in the terminal, gdu-style. It is strictly read-only: nothing can be deleted
+  or changed from it.
 - **Live progress** — optional progress counter updated every 100 entries.
 
 ## Building
 
-The build uses standard GNU Makefile conventions and depends only on a C11
-compiler and a Linux kernel/glibc with `statx()` support (Linux 4.11+,
-glibc 2.28+).
+The build uses standard GNU Makefile conventions and depends on a C11
+compiler, a Linux kernel/glibc with `statx()` support (Linux 4.11+,
+glibc 2.28+) and, for `--tui`, the ncursesw library and headers. On systems
+without ncurses, build with `make WITH_TUI=no` to leave the browser out.
 
 ```sh
 make            # build ./fue
@@ -73,6 +77,7 @@ fue [options] <path>
 | `--progress`         | Show a live counter of processed entries (updated every 100), on stderr. |
 | `-j`, `--threads N`  | Scan with `N` parallel threads, 1–256 (default 8). `-j 1` is serial.     |
 | `-d`, `--depth N`    | Break usage down by directory, `N` levels deep (see below).              |
+| `--tui`              | Browse the results interactively (read-only; see below).                 |
 | `-h`, `--help`       | Show usage and exit.                                                     |
 
 Exactly one target path is required.
@@ -88,6 +93,9 @@ fue --no-cache --progress /scratch/project_2001234
 
 # Usage of each project directory and one level below it
 fue --depth 2 /scratch/project_2001234
+
+# Scan, then browse the tree interactively
+fue --tui -j 16 /scratch/project_2001234
 
 # Use more threads on a large tree (or -j 1 for a gentle serial scan)
 fue -j 16 /scratch/project_2001234
@@ -160,6 +168,44 @@ subtree, and the first row is the grand total:
 `--csv` the breakdown is one row per directory, in the same order:
 `depth,path,total_size_bytes,total_blocks,reg_files,directories,symlinks,other,perm_denied_errors`.
 The cache stores only totals, so `--depth` always performs a fresh scan.
+
+### Interactive browser
+
+`fue --tui <path>` scans the tree (showing progress), then opens a browser in
+the terminal. Each row shows an entry's allocated and apparent size, its share
+of the current directory, a bar relative to the largest entry, and (for
+directories) how many entries it contains:
+
+```
+ fue v0.3.0  /scratch/project_2001234/alice
+ Allocated 912.07 GiB  Apparent 910.55 GiB  Items 210,788  Denied 0  [sort: size]
+   Allocated    Apparent  Share                  Items  Name
+                                                        ..
+  655.20 GiB  654.98 GiB  71.8% [##########]   156,103  simulations/
+  256.87 GiB  255.57 GiB  28.2% [####      ]    54,684  analysis/
+    4.00 KiB    1.21 KiB   0.0% [          ]            README.md
+```
+
+| Key                  | Action                                                 |
+| -------------------- | ------------------------------------------------------ |
+| Up/Down, `j`/`k`     | Move                                                   |
+| PgUp/PgDn, `g`/`G`   | Move a page / to the top or bottom                     |
+| Enter, Right, `l`    | Open a directory (or show a file's details)            |
+| Left, Backspace, `h` | Go to the parent directory                             |
+| `a`                  | Toggle allocated / apparent size for bars and sorting  |
+| `s` / `n` / `c`      | Sort by size / name / item count                       |
+| `i`                  | Show details, including the allocated / apparent ratio |
+| `?`                  | Help                                                   |
+| `q`                  | Quit                                                   |
+
+`!` marks directories containing entries that could not be read (their totals
+are undercounts) and `@` marks symbolic links. There are no keys to delete,
+modify or run anything.
+
+To keep memory small on very large trees, the scan stores totals for every
+directory but not individual files; a directory's files are listed the first
+time you open it. `--tui` cannot be combined with `--csv`, and like `--depth`
+it always performs a fresh scan.
 
 ## Caching
 
